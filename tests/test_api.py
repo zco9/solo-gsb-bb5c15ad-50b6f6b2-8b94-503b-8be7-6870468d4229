@@ -2184,3 +2184,176 @@ def test_reassemble_last_fragment_unaligned_payload_ok():
 def test_reassemble_endpoints_listed_in_openapi():
     schema = client.get("/openapi.json").json()
     assert "/ipv4/reassemble" in schema["paths"]
+
+
+# ---------- /ipv4/fragment ----------
+
+
+def post_fragment(payload, header_bytes=20, mtu=1500, dont_fragment=False, **extra):
+    import base64
+
+    body = {
+        "payload": (
+            payload
+            if isinstance(payload, str)
+            else base64.b64encode(payload).decode()
+        ),
+        "header_bytes": header_bytes,
+        "mtu": mtu,
+        "dont_fragment": dont_fragment,
+    }
+    body.update(extra)
+    return client.post("/ipv4/fragment", json=body)
+
+
+def test_fragment_unfragmented_basic():
+    resp = post_fragment(b"hello")
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "status": "unfragmented",
+        "fragment_count": 1,
+        "fragments": [
+            {
+                "offset": 0,
+                "more_fragments": False,
+                "payload": "aGVsbG8=",
+                "total_length": 25,
+            }
+        ],
+    }
+
+
+def test_fragment_unfragmented_exact_mtu():
+    assert post_fragment(b"x" * 80, mtu=100).json()["status"] == "unfragmented"
+    assert post_fragment(b"x" * 80, mtu=99).json()["status"] == "fragmented"
+
+
+def test_fragment_unfragmented_preserves_original_offset_and_mf():
+    resp = post_fragment(
+        b"hello", original_offset=5, original_more_fragments=True
+    )
+    assert resp.status_code == 200
+    fragment = resp.json()["fragments"][0]
+    assert fragment["offset"] == 5
+    assert fragment["more_fragments"] is True
+    assert fragment["total_length"] == 25
+
+
+def test_fragment_unfragmented_df_true_still_forwards():
+    resp = post_fragment(b"hello", dont_fragment=True)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "unfragmented"
+
+
+def test_fragment_fragmented_basic():
+    resp = post_fragment(b"hello-world-ipv4!!!!", mtu=28)
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "status": "fragmented",
+        "fragment_count": 3,
+        "fragments": [
+            {"offset": 0, "more_fragments": True,
+             "payload": "aGVsbG8td28=", "total_length": 28},
+            {"offset": 1, "more_fragments": True,
+             "payload": "cmxkLWlwdjQ=", "total_length": 28},
+            {"offset": 2, "more_fragments": False,
+             "payload": "ISEhIQ==", "total_length": 24},
+        ],
+    }
+
+
+def test_fragment_fragmented_max_8_byte_multiple():
+    # MTU 30、首部 20 → 预算 10 向下取 8；24 字节切成 8/8/8
+    resp = post_fragment(b"A" * 24, mtu=30)
+    assert resp.status_code == 200
+    body = resp.json()
+    import base64
+
+    assert [len(base64.b64decode(f["payload"])) for f in body["fragments"]] == [
+        8, 8, 8,
+    ]
+    assert [f["offset"] for f in body["fragments"]] == [0, 1, 2]
+    assert [f["more_fragments"] for f in body["fragments"]] == [
+        True, True, False,
+    ]
+
+
+def test_fragment_needs_fragmentation_no_payload():
+    resp = post_fragment(b"x" * 100, mtu=28, dont_fragment=True)
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "status": "needs_fragmentation",
+        "fragment_count": 0,
+        "fragments": [],
+    }
+
+
+def test_fragment_refragment_offsets_and_mf():
+    resp = post_fragment(
+        b"A" * 20, mtu=28, original_offset=2, original_more_fragments=True
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "fragmented"
+    assert [f["offset"] for f in body["fragments"]] == [2, 3, 4]
+    # 最后子片继承原始 MF=true
+    assert [f["more_fragments"] for f in body["fragments"]] == [
+        True, True, True,
+    ]
+    resp = post_fragment(
+        b"A" * 20, mtu=28, original_offset=7, original_more_fragments=False
+    )
+    assert [f["more_fragments"] for f in resp.json()["fragments"]] == [
+        True, True, False,
+    ]
+
+
+def test_fragment_mtu_too_small_422():
+    resp = post_fragment(b"x" * 100, mtu=27)
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == {"error": "mtu_too_small", "limit": 28}
+    # 边界：MTU 28 = 首部 20 + 8，恰好可以切片
+    assert post_fragment(b"x" * 100, mtu=28).status_code == 200
+
+
+def test_fragment_datagram_too_large_422():
+    resp = post_fragment(b"\x00" * 65516, header_bytes=20)
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == {
+        "error": "datagram_too_large",
+        "limit": 65535,
+    }
+    # 恰好 65535 不越界
+    resp = post_fragment(b"\x00" * 65475, header_bytes=60, mtu=65535)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "unfragmented"
+
+
+def test_fragment_validation_422():
+    # 缺少必填字段
+    assert client.post("/ipv4/fragment", json={}).status_code == 422
+    assert client.post(
+        "/ipv4/fragment",
+        json={"payload": "", "header_bytes": 20, "mtu": 1500},
+    ).status_code == 422
+    # header_bytes 越界 / 类型
+    for bad in (19, 61, 0, "20", 20.0, True):
+        assert post_fragment(b"", header_bytes=bad).status_code == 422
+    # mtu 非正整数 / 类型
+    for bad in (0, -1, "1500", 1500.0, True):
+        assert post_fragment(b"x" * 100, mtu=bad).status_code == 422
+    # dont_fragment / original_more_fragments 非布尔
+    assert post_fragment(b"", dont_fragment="true").status_code == 422
+    assert post_fragment(b"", dont_fragment=1).status_code == 422
+    assert post_fragment(b"", original_more_fragments="false").status_code == 422
+    # original_offset 越界 / 类型
+    for bad in (-1, 8192, 1.5, "0", True):
+        assert post_fragment(b"", original_offset=bad).status_code == 422
+    # 非法 Base64
+    assert post_fragment("not base64!").status_code == 422
+    assert post_fragment("A").status_code == 422
+
+
+def test_fragment_endpoint_listed_in_openapi():
+    schema = client.get("/openapi.json").json()
+    assert "/ipv4/fragment" in schema["paths"]
