@@ -28,6 +28,11 @@ from .firewall import (
     OverlappingSessionError,
     simulate_firewall,
 )
+from .fragmentation import (
+    MTU_MIN,
+    FragmentationInputError,
+    plan_fragmentation,
+)
 from .reassembly import (
     FRAGMENTS_MAX,
     HEADER_MAX,
@@ -76,8 +81,14 @@ app = FastAPI(
         "越过 65535 字节数据报上限报错；重复一致覆盖可接受，重叠字节冲突"
         "返回首个冲突偏移，无冲突但有缺口返回合并后的缺失半开区间，覆盖"
         "完整时返回贡献分片索引与重组后的 Base64 载荷。"
+        "通过 /ipv4/fragment 按 MTU 与 DF 标志规划 IPv4 数据报分片："
+        "首部加载荷不超 MTU 时原样返回一个分片，超限且 DF=true 时返回 "
+        "needs_fragmentation 且不输出载荷，其余按输入顺序切片（非末片取不超 "
+        "MTU 的最大 8 字节倍数载荷、偏移以 8 字节计）；支持对已有分片再次"
+        "切分（子片偏移叠加原始偏移、最后子片继承原始 MF），MTU 容不下任何"
+        "合法非末片载荷时返回 422。"
     ),
-    version="1.10.0",
+    version="1.11.0",
 )
 
 
@@ -981,6 +992,104 @@ class IPv4ReassembleResponse(BaseModel):
     first_conflict_offset: int | None = Field(
         default=None,
         description="conflict：全部分片中最小的不一致重叠字节偏移；其余状态为 null",
+    )
+
+
+# ---------- /ipv4/fragment ----------
+
+
+class IPv4FragmentRequest(BaseModel):
+    """IPv4 分片规划请求：Base64 载荷 + 20～60 字节首部 + MTU + DF，可选原始片信息。"""
+
+    payload: StrictStr = Field(
+        ...,
+        description=(
+            "待切分数据报（或已有分片）载荷的标准 Base64 编码；空串为空载荷"
+        ),
+    )
+    header_bytes: int = Field(
+        ..., ge=HEADER_MIN, le=HEADER_MAX, strict=True,
+        description="IPv4 首部长度（IHL × 4），20～60 字节的整数",
+    )
+    mtu: int = Field(
+        ..., ge=MTU_MIN, strict=True,
+        description=(
+            "链路 MTU（含 IPv4 首部，单位字节）的正整数；需分片时若 MTU 容纳"
+            "首部后放不下 8 字节则返回 422（mtu_too_small）"
+        ),
+    )
+    dont_fragment: bool = Field(
+        ...,
+        description=(
+            "DF（Don't Fragment）标志：true 时超过 MTU 返回 "
+            "needs_fragmentation 且不输出载荷"
+        ),
+    )
+    original_offset: int = Field(
+        default=0, ge=0, strict=True,
+        description=(
+            "原始片偏移，以 8 字节为单位的非负整数（对已有分片再次切分时提供，"
+            "各子片输出偏移叠加该值）；默认 0"
+        ),
+    )
+    original_more_fragments: bool = Field(
+        default=False,
+        description=(
+            "原始片 MF 标志：对已有分片再次切分时，最后一个子片继承该值，"
+            "其余子片 MF 恒为 true；默认 false（即原始完整数据报）"
+        ),
+    )
+
+    @field_validator("payload")
+    @classmethod
+    def validate_payload(cls, value: str) -> str:
+        # 仅做标准 Base64 解码校验，核心层复用 decode_payload 取得字节
+        decode_payload(value)
+        return value
+
+    @field_validator("dont_fragment", "original_more_fragments", mode="before")
+    @classmethod
+    def reject_non_bool(cls, value: object) -> object:
+        # 与项目其他布尔入参保持一致，明确拒绝非 bool 输入 -> 422
+        if not isinstance(value, bool):
+            raise ValueError("DF / MF 标志必须是布尔值 true 或 false")
+        return value
+
+
+class IPv4FragmentPlanned(BaseModel):
+    """单个输出分片：8 字节单位偏移 + MF + Base64 载荷 + 本片总长度。"""
+
+    offset: int = Field(..., description="片偏移（fragment offset），以 8 字节为单位")
+    more_fragments: bool = Field(
+        ..., description="MF 标志：true 表示还有后续分片，false 表示最终片"
+    )
+    payload: StrictStr = Field(..., description="本片载荷的标准 Base64 编码")
+    total_length: int = Field(
+        ..., description="本片总长度（IPv4 首部长度 + 本片载荷字节数）"
+    )
+
+
+class IPv4FragmentResponse(BaseModel):
+    status: Literal["unfragmented", "fragmented", "needs_fragmentation"] = Field(
+        ...,
+        description=(
+            "unfragmented：不超 MTU，原样返回一个分片；fragmented：已按 MTU "
+            "切片；needs_fragmentation：超 MTU 且 DF=true，不输出载荷"
+        ),
+    )
+    header_bytes: int = Field(..., description="回显请求的 IPv4 首部长度")
+    mtu: int = Field(..., description="回显请求的 MTU")
+    dont_fragment: bool = Field(..., description="回显请求的 DF 标志")
+    original_offset: int = Field(..., description="回显请求的原始片偏移（8 字节单位）")
+    fragment_count: int = Field(
+        ..., description="输出分片数；needs_fragmentation 时为 0"
+    )
+    fragments: list[IPv4FragmentPlanned] = Field(
+        ...,
+        description=(
+            "按输入顺序排列的输出分片，每片给出 offset / more_fragments / "
+            "Base64 payload / total_length；needs_fragmentation 时为空列表"
+        ),
     )
 
 
@@ -2006,3 +2115,168 @@ def ipv4_reassemble(
             status_code=422,
             detail={"error": exc.error, "indexes": exc.indexes, "limit": exc.limit},
         ) from exc
+
+
+@app.post(
+    "/ipv4/fragment",
+    response_model=IPv4FragmentResponse,
+    tags=["reassembly"],
+    summary="按 MTU 与 DF 标志规划 IPv4 数据报分片（支持对已有分片再次切分）",
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "fragmented": {
+                            "summary": "40 字节载荷、20 字节首部、MTU 44：24 + 16 切 2 片",
+                            "value": {
+                                "status": "fragmented",
+                                "header_bytes": 20,
+                                "mtu": 44,
+                                "dont_fragment": False,
+                                "original_offset": 0,
+                                "fragment_count": 2,
+                                "fragments": [
+                                    {"offset": 0, "more_fragments": True,
+                                     "payload": "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB", "total_length": 44},
+                                    {"offset": 3, "more_fragments": False,
+                                     "payload": "QUFBQUFBQUFBQUFBQUFBQQ==", "total_length": 36},
+                                ],
+                            },
+                        },
+                        "unfragmented": {
+                            "summary": "数据报不超 MTU：原样返回一个分片",
+                            "value": {
+                                "status": "unfragmented",
+                                "header_bytes": 20,
+                                "mtu": 1500,
+                                "dont_fragment": False,
+                                "original_offset": 0,
+                                "fragment_count": 1,
+                                "fragments": [
+                                    {"offset": 0, "more_fragments": False,
+                                     "payload": "aGVsbG8=", "total_length": 25}
+                                ],
+                            },
+                        },
+                        "needs_fragmentation": {
+                            "summary": "超 MTU 且 DF=true：不输出载荷",
+                            "value": {
+                                "status": "needs_fragmentation",
+                                "header_bytes": 20,
+                                "mtu": 50,
+                                "dont_fragment": True,
+                                "original_offset": 0,
+                                "fragment_count": 0,
+                                "fragments": [],
+                            },
+                        },
+                    }
+                }
+            }
+        },
+        422: {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "datagram_too_large": {
+                            "summary": "首部加载荷越过 IPv4 65535 字节上限",
+                            "value": {"detail": {"error": "datagram_too_large", "limit": 65535}},
+                        },
+                        "mtu_too_small": {
+                            "summary": "MTU 容纳首部后放不下最小 8 字节非末片载荷",
+                            "value": {
+                                "detail": {
+                                    "error": "mtu_too_small",
+                                    "mtu": 27,
+                                    "header_bytes": 20,
+                                }
+                            },
+                        },
+                    }
+                }
+            }
+        },
+    },
+)
+def ipv4_fragment(
+    request: IPv4FragmentRequest = Body(
+        ...,
+        openapi_examples={
+            "fragment": {
+                "summary": "100 字节载荷按 MTU 50 切片（20 字节首部，非末片 24 字节）",
+                "value": {
+                    "payload": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    "header_bytes": 20,
+                    "mtu": 50,
+                    "dont_fragment": False,
+                },
+            },
+            "refragment": {
+                "summary": "对已有分片（offset=10、MF=true、40 字节）用 MTU 44 再次切分",
+                "value": {
+                    "payload": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    "header_bytes": 20,
+                    "mtu": 44,
+                    "dont_fragment": False,
+                    "original_offset": 10,
+                    "original_more_fragments": True,
+                },
+            },
+            "needs_fragmentation": {
+                "summary": "超 MTU 且 DF=true：ICMP 不可达场景，不输出载荷",
+                "value": {
+                    "payload": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    "header_bytes": 20,
+                    "mtu": 40,
+                    "dont_fragment": True,
+                },
+            },
+        },
+    ),
+) -> dict:
+    """按 MTU 与 DF 标志规划一个 IPv4 数据报（或**已有分片**）的分片：
+
+    - **无需分片**：``header_bytes + len(payload) ≤ mtu`` 时原样返回
+      **一个**分片，``offset`` / ``more_fragments`` 继承请求给出的原始片
+      信息（默认 ``0`` / ``false``），``status="unfragmented"``；
+    - **DF 禁止分片**：超过 MTU 且 ``dont_fragment=true`` 时返回
+      ``status="needs_fragmentation"``、``fragment_count=0``、
+      ``fragments=[]``，**不输出任何载荷**；
+    - **按序切片**：其余情况下按输入顺序切分——除最终片外每片载荷取
+      ``mtu - header_bytes`` 以内**最大的 8 字节倍数**（IPv4 片偏移以 8
+      字节计），各非末片 ``more_fragments=true``，最终片为剩余字节（长度
+      可不被 8 整除）；
+    - **再次切分已有分片**：提供 ``original_offset``（8 字节单位）与
+      ``original_more_fragments`` 时，各子片输出偏移**叠加原始偏移**，
+      **最后一个子片继承原始 MF**（原始 MF=true 时全部分片均 MF=true），
+      其余子片 MF 恒为 ``true``；
+    - **长度上限**：首部加载荷越过 IPv4 **65535** 字节上限时返回 **422**
+      （``error="datagram_too_large"``）；
+    - **MTU 过小**：必须分片但 MTU 容纳首部后放不下最小 8 字节非末片载荷
+      （即 ``mtu < header_bytes + 8``）时返回 **422**
+      （``error="mtu_too_small"``，附 ``mtu`` / ``header_bytes``）。
+
+    每个输出分片给出 ``offset``（8 字节单位）、``more_fragments``、标准
+    Base64 ``payload`` 与 ``total_length``（首部 + 本片载荷字节数）。
+    非法 Base64、``header_bytes`` 不在 20～60、非正整数 ``mtu``、负/非整数
+    ``original_offset``、非布尔 DF/MF 等同样返回 **422**。
+    """
+    try:
+        return plan_fragmentation(
+            request.header_bytes,
+            decode_payload(request.payload),
+            request.mtu,
+            request.dont_fragment,
+            request.original_offset,
+            request.original_more_fragments,
+        )
+    except FragmentationInputError as exc:
+        detail: dict = {"error": exc.error}
+        if exc.limit is not None:
+            detail["limit"] = exc.limit
+        if exc.mtu is not None:
+            detail["mtu"] = exc.mtu
+            detail["header_bytes"] = exc.header_length
+        # 语义类输入错误：422
+        raise HTTPException(status_code=422, detail=detail) from exc
